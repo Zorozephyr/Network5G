@@ -1,0 +1,404 @@
+# NaaS 5G UPF HLD — Architecture Analysis, Uniqueness Assessment & Publishability
+
+## 1. Executive Summary of the Architecture
+
+Your HLD proposes a **4-layer hybrid eBPF/WebAssembly data plane** for 5G User Plane Functions, orchestrated by a Kubernetes Operator, enabling **Network-as-a-Service (NaaS) tenant plugin injection**:
+
+| Layer | Component | Role |
+|-------|-----------|------|
+| L1 — Kernel | eBPF/XDP program | Fast-path GTP-U forwarding (~99% traffic). TEID lookup via `BPF_MAP_TYPE_HASH`. Exception packets redirected via `XDP_REDIRECT` to AF_XDP socket |
+| L2 — User-space | Rust daemon + AF_XDP | Kernel-to-userspace zero-copy reception. Bounded payload copy into Wasm linear memory. Manages Wasm lifecycle |
+| L3 — Sandbox | WebAssembly runtime | Executes tenant-supplied DPI/billing plugins. Returns verdicts: PASS, PASS_MOD, DROP, TAG, METER |
+| L4 — Control | K8s Operator (Go) | Central Controller watches `WasmPlugin` CRDs. Per-pod Sidecar agent handles OCI pull + gRPC upgrade trigger |
+
+**Core mechanism**: Hitless plugin upgrade via **RCU-protected atomic BPF map pointer swap** from plugin v1 → v2 with a drain window for in-flight packets.
+
+---
+
+## 2. Uniqueness Assessment (Prior Art Mapping)
+
+I conducted 8 targeted web searches and cross-referenced your reading list. Here is where your work sits relative to the state of the art:
+
+### 2.1 What IS Prior Art (Not Novel)
+
+| Claim | Prior Art | Status |
+|-------|-----------|--------|
+| eBPF/XDP for 5G UPF fast-path | **eUPF** (edgecomllc/eupf), **Cable** (free5GC), **NgKore**, various academic prototypes | ⚠️ Well-established. Multiple open-source and commercial implementations |
+| Wasm on Kubernetes | **SpinKube**, **KWasm**, **runwasi**, Envoy Wasm filters | ⚠️ Mature ecosystem. CNCF sandbox project (SpinKube) |
+| Wasm managing eBPF (control plane) | **wasm-bpf** (eunomia.dev), Zheng et al. 2024 | ⚠️ Published and open-sourced |
+| eBPF shared-memory processing | **SPRIGHT** (Qi et al., ACM SIGCOMM 2022/2024) | ⚠️ Top-tier venue publication |
+| Wasm plugins for O-RAN | **WA-RAN** (HotNets '24, SIGCOMM workshop) | ⚠️ Published at a competitive venue |
+| Atomic BPF program replacement | `bpf_link_update()`, **BPF Map Tracing** (Joe Burton, Google, LPC) | ⚠️ Known kernel mechanism |
+
+### 2.2 What IS Genuinely Novel
+
+> [!WARNING]
+> **The Proxy-Wasm / Istio Elephant in the Room**: Istio's `WasmPlugin` CRD + Envoy's inline Wasm execution is structurally similar to Layers 3–4 of this design. Reviewers familiar with service mesh will immediately notice this. The genuine novelty is **not** "Wasm-on-K8s" (heavily prior-arted) — it is the **eBPF fast-path + GTP-U specificity + atomic BPF map swap for hitless upgrade**. The paper must explicitly differentiate from Proxy-Wasm by emphasizing: (a) kernel-level packet interception vs L7 proxy interception, (b) GTP-U header-transparent execution, (c) RCU-protected BPF map swap vs Envoy's listener drain.
+
+| Claim | Nearest Prior Art | Gap Your Work Fills |
+|-------|-------------------|---------------------|
+| **Hitless BPF map pointer swap for Wasm plugin lifecycle** | BPF Map Tracing (Burton) handles stateful program migration; Envoy uses listener drain for Wasm filter updates | ✅ First to combine RCU-protected per-TEID map swap with Wasm runtime dual-instance drain cycle for 5G UPF. Sub-millisecond switchover vs Envoy's seconds-scale drain |
+| **Telecom NaaS plugin ABI** (PASS/PASS_MOD/DROP/TAG/METER verdict API) | Envoy Wasm ABI exists for HTTP proxies; WA-RAN defines RAN-specific Wasm interfaces; Proxy-Wasm SDK is the closest analogue | ✅ No prior work defines a tenant-facing Wasm ABI for **in-band GTP-U L7 payload processing** with header-transparent execution. Proxy-Wasm operates on HTTP streams, not raw GTP-U encapsulated packets |
+| **K8s CRD-driven operator for carrier-grade UPF plugin management** | Istio `WasmPlugin` CRD manages Envoy filters; NetEdit (Meta) orchestrates eBPF at fleet scale; SpinKube orchestrates Wasm apps | ✅ Novel synthesis — first to combine CRD-driven intent → OCI pull → Wasm injection → **BPF map update** on a live 5G data plane. Istio's CRD never touches kernel BPF maps |
+| **Fail-open fault model for telecom Wasm execution** | No prior work defines fuel metering + watchdog timeout + AF_XDP backpressure as a combined fail-open strategy for carrier-grade sessions | ✅ Novel contribution to telecom reliability engineering |
+
+### 2.3 Uniqueness Verdict
+
+> [!IMPORTANT]
+> **The individual building blocks are established, but the specific combination — eBPF fast-path → AF_XDP zero-copy → Wasm sandbox → K8s Operator lifecycle — applied to live 5G GTP-U traffic with formal hitless upgrade guarantees, is genuinely novel.** No published paper or open-source project assembles these pieces in this specific way for the telecom domain.
+
+The closest competitor is **WA-RAN** (HotNets '24), but it targets O-RAN RIC plugins, not UPF in-band payload processing, and lacks hitless upgrade guarantees.
+
+---
+
+## 3. Architectural Flaw Analysis
+
+### 3.1 Critical Flaws
+
+#### Flaw 1: AF_XDP UMEM → Wasm Memory Copy is a Throughput Bottleneck `[ACCEPTED — REFRAME AS STRENGTH]`
+- **The problem**: Your design copies payload bytes from AF_XDP UMEM into Wasm linear memory on entry, and copies modified bytes back on PASS_MOD exit. For 1500B payloads, this is **two memcpy operations per exception-path packet**.
+- **Impact**: At high exception-path ratios (>5%), this double-copy will dominate latency and limit throughput. Your "1% exception path" assumption is critical but unvalidated.
+- **Decision**: Do **not** pursue shared-memory mapping (it destroys Wasm isolation). Instead, reframe the double-copy as the **measurable cost of tenant-safe plugin execution**. The paper should present this as a design trade-off contribution: safety vs. throughput, with the copy overhead bounded at `2 × payload_len` bytes per exception packet.
+
+#### Flaw 2: veth Reinjection Adds Non-Trivial Latency `[ACCEPTED FOR MEASUREMENT]`
+- **The problem**: After Wasm processing, the modified frame is written to the AF_XDP TX ring, submitted through the kernel, and re-enters the UPF namespace via a **veth pair**. Veth devices traverse the full kernel networking stack on the receiving end.
+- **Impact**: Per-packet overhead of ~2–5μs from veth traversal (qdisc, netfilter, IP routing on the RX side).
+
+**Reinjection alternatives evaluated:**
+
+| Approach | Kernel Stack Traversal | Complexity | Verdict |
+|----------|----------------------|------------|--------|
+| **veth pair (current)** | ❌ Full: qdisc, netfilter, IP routing | Low | ✅ **Phase 1 choice** — works with unmodified Open5GS |
+| **AF_XDP on both sides** | ✅ Zero bypass | 🔴 Very High — requires modifying Open5GS to read from AF_XDP | Future optimization |
+| **tun/tap device** | ⚠️ Partial — bypasses L2/qdisc, still hits IP routing | Medium | Possible Phase 2 |
+| **Unix domain socket** | ✅ Zero kernel network stack | 🔴 Requires UPF modification | Not pursued |
+
+**Checksum interaction**: Because the veth path has no physical NIC hardware, `CHECKSUM_PARTIAL` (hardware offload) **cannot be used** for the reinjection leg. The Rust daemon must perform **software UDP checksum recalculation** over the modified payload before writing to the XSK TX ring. Cost: ~100–200ns for a 1500B payload — negligible vs. the ~2–5μs veth traversal.
+
+- **Decision**: Proceed with veth for Phase 1. Measure latency. Use software checksum. Document "AF_XDP-to-AF_XDP bypass" as future optimization.
+
+#### Flaw 3: Single-TEID Granularity for Exception Routing is Inflexible `[ACCEPTED AS OOS]`
+- **The problem**: Exception routing is based solely on TEID lookup in a BPF hash map. This means you can only route **all packets** from a given session to the Wasm engine, not specific flows within a session.
+- **Impact**: A session carrying mixed traffic (e.g., IoT telemetry + video) cannot selectively route only the telemetry to DPI while keeping video on the fast path.
+- **Recommendation**: Consider adding a **secondary filter** (e.g., inner 5-tuple match after GTP-U decap) to the eBPF program. This adds complexity but dramatically improves flexibility.
+- **Decision**: Keep single-TEID for Phase 1 simplicity, but document this secondary filter as a strong future work addition.
+
+### 3.2 Moderate Concerns
+
+#### Flaw 4: Drain Window Race Condition is Under-Specified
+- Your HLD acknowledges that if a v1 invocation exceeds `drainWindowMs`, v1 is force-killed and "at most one packet per affected session" is lost. However:
+  - What happens to the **Wasm linear memory** that v1 was writing to? Is it properly freed?
+  - What if v1's fuel budget allows it to run for >100ms legitimately (a deep DPI scan on a jumbo payload)?
+  - **Recommendation**: Define a formal relationship: `drainWindowMs > max(fuelBudget execution time at P99.9)`. Currently these are independent configuration parameters.
+
+#### Flaw 5: Multi-Tenancy Isolation Model `[ACCEPTED — PER-SLICE WASM INSTANCE]`
+- The HLD mentions `targetSelector: upfPodLabel: "tenant=enterprise-A"` but originally didn't define the isolation boundary.
+
+**Resolved design — Per-Slice Wasm Instantiation:**
+
+```
+┌──────────────────────────────────────────────────────┐
+│                     UPF Pod                          │
+│                                                      │
+│  eBPF XDP Program                                    │
+│  ┌────────────────────────────────────────────────┐  │
+│  │  TEID Map (BPF_MAP_TYPE_HASH)                  │  │
+│  │  Key: TEID  →  Value: {slice_id, plugin_id}    │  │
+│  └────────────┬───────────────────────────────────┘  │
+│               │ XDP_REDIRECT per slice_id            │
+│       ┌───────┴───────┐                              │
+│       ▼               ▼                              │
+│  ┌─────────┐    ┌─────────┐                          │
+│  │ AF_XDP  │    │ AF_XDP  │   (one socket per slice) │
+│  │ Slice A │    │ Slice B │                          │
+│  └────┬────┘    └────┬────┘                          │
+│       ▼               ▼                              │
+│  ┌─────────┐    ┌─────────┐                          │
+│  │  Wasm   │    │  Wasm   │   (isolated linear       │
+│  │ Runtime │    │ Runtime │    memory per slice)      │
+│  └─────────┘    └─────────┘                          │
+│                                                      │
+│  Rust Daemon (manages all instances)                 │
+└──────────────────────────────────────────────────────┘
+```
+
+**Why this works:**
+1. **Automatic isolation**: Each slice gets its own Wasm instance with independent linear memory. Cross-tenant data leakage is impossible at the Wasm level
+2. **Maps to 5G natively**: Network slices are the natural 3GPP multi-tenancy boundary. TEIDs already belong to specific slices
+3. **Free eBPF routing**: Extend BPF map value from `{plugin_id}` to `{slice_id, plugin_id}`. eBPF uses `slice_id` to redirect to the correct AF_XDP socket
+4. **Hitless upgrade scoped per-slice**: Upgrade Slice A's plugin while Slice B is completely unaffected
+
+- **Decision**: Phase 1 validates with a single slice (single TEID set). The per-slice isolation model is an **architectural guarantee documented in the HLD**, validated in Phase 2.
+
+### 3.3 Minor Issues
+
+| Issue | Impact | Fix |
+|-------|--------|-----|
+| No mention of PFCP integration for TEID discovery | Phase 1 uses static TEIDs, but the paper needs to address how TEIDs are dynamically learned from the SMF | Add a "Future Work" section covering PFCP session event subscription (Accepted) |
+| UDP checksum recalculation after PASS_MOD | Required on the veth reinjection path since HW offload is unavailable on virtual devices | Software recalculation in Rust daemon before XSK TX ring write (~100-200ns). `CHECKSUM_PARTIAL` reserved for future AF_XDP-to-NIC direct egress path (Accepted) |
+| Fuel budget sizing has no guidance | How does an operator choose the fuel budget? | Add a single line declaring `drainWindowMs > P99.9(fuel execution)` (Accepted) |
+| No DPDK comparison | Reviewers at top venues will ask "why not DPDK?" | Move to the end along with WA-RAN in the novelty/related work section (Accepted) |
+
+---
+
+## 4. Publishability Assessment
+
+### 4.1 Target Venue Analysis
+
+| Venue | Type | Fit | Difficulty | Recommendation |
+|-------|------|-----|------------|----------------|
+| **ACM SIGCOMM** | Top-tier conference | Good fit but requires strong experimental evaluation | 🔴 Very hard (~15% acceptance) | Aspirational. Need multi-node testbed + line-rate results |
+| **USENIX NSDI** | Top-tier systems conference | Excellent fit for systems contributions | 🔴 Very hard (~18% acceptance) | Strong target if prototype demonstrates real-world throughput |
+| **IEEE NFV-SDN** | Specialized conference | Perfect topical fit | 🟢 Moderate (~30-40% acceptance) | **Recommended first target**. Your novelty aligns precisely |
+| **ACM CoNEXT** | Strong networking conference | Good fit | 🟡 Hard (~20% acceptance) | Good stretch target |
+| **IEEE TNSM** (journal) | Transactions journal | Excellent fit for operator/management focus | 🟡 Moderate | **Best journal target**. Aligns with Kubernetes operator management focus |
+| **Computer Networks** (Elsevier) | Broad networking journal | Good fit | 🟡 Moderate | Solid option |
+| **IEEE Communications Magazine** | Industry magazine | Great for architecture papers | 🟢 Moderate | Good for visibility, less rigorous evaluation needed |
+
+### 4.2 What Reviewers Will Require
+
+To publish in a well-respected venue, you need to demonstrate:
+
+1. **Working prototype** (not just design): Your Phase 1 scope is appropriate, but the code must actually work and produce numbers
+2. **Quantitative evaluation**:
+   - Fast-path throughput in Gbps (compare eBPF-only vs. eBPF+Wasm overhead)
+   - Exception-path per-packet latency at P50/P99/P99.9
+   - Hitless switchover time (ns/μs) during live traffic
+   - Zero packet drop proof during BPF map swap
+3. **Baseline comparison**: At minimum, compare against:
+   - Open5GS UPF (vanilla, no eBPF)
+   - eUPF (eBPF-only, no Wasm)
+   - Your system (eBPF + Wasm + Operator)
+4. **Scalability data**: Multiple concurrent TEIDs, multiple Wasm plugins, multiple upgrade cycles
+
+### 4.3 Publishability Verdict
+
+> [!TIP]
+> **Yes, this idea is publishable in a well-respected venue**, provided you build the prototype and produce strong experimental numbers. The architecture is novel, well-motivated by real telecom pain (vendor lock-in + hitless upgrades), and sits at a genuine intersection that no existing paper has claimed.
+
+**Strongest publishing angle**: The **hitless upgrade mechanism** (atomic BPF map swap + drain cycle) is the most defensible novelty. Frame the paper around this mechanism, with the NaaS plugin API and K8s Operator as supporting contributions.
+
+**Realistic timeline to submission**: Based on your 12-week methodology, target **IEEE NFV-SDN** or **IEEE TNSM** as first submissions. These venues value practical systems contributions and the eBPF/Wasm/telecom intersection is directly within scope.
+
+---
+
+## 5. Recommendations for Strengthening the Paper
+
+1. **Add a formal threat model**: Define what a malicious tenant plugin can and cannot do. Your "malicious inputs are out of scope" stance will not survive peer review at top venues
+2. **Add DPDK comparison section**: Even if brief, explain _why_ eBPF/XDP over DPDK (hint: kernel integration, no dedicated cores, easier K8s scheduling)
+3. **Quantify the exception-path ratio assumption**: Your architecture assumes 1% exception traffic. Run experiments with 1%, 5%, 10%, 20% to show degradation curves
+4. **Define the tenant isolation boundary formally**: Per-Slice Wasm Instance model (see Flaw 5 resolution above)
+5. **Address encrypted traffic**: If GTP-U payloads are encrypted (IPsec in transport mode), your L7 DPI is blind. Acknowledge this limitation
+6. **Benchmark against WA-RAN**: Since it's the closest published work, a qualitative or quantitative comparison would strengthen your positioning
+7. **Explicitly differentiate from Proxy-Wasm/Istio**: Add a "Comparison with Service Mesh Wasm" subsection. Emphasize kernel-level interception, GTP-U specificity, and BPF-map-level atomicity
+8. **State "WasmEdge in AOT mode" explicitly**: The 500μs timeout claim is only credible with AOT-compiled Wasm. Interpreted mode will exceed this for non-trivial DPI
+9. **Software checksum in Rust daemon**: Document that veth reinjection requires software UDP checksum recalculation; `CHECKSUM_PARTIAL` is not available on virtual devices
+10. **Document single-threaded Phase 1 limitation explicitly**: Add one-sentence threading model statement to design section
+
+---
+
+## 6. Deep-Dive Vulnerability Analysis (Debated Issues)
+
+The following issues were subjected to adversarial review. Each includes the original concern, the author's counter-argument, and the **resolved position** for the paper.
+
+---
+
+### V1: The "Zero-Copy" Contradiction
+
+**Original Concern**: The HLD claims "zero-copy" via AF_XDP but then performs a double `memcpy` at the Wasm boundary (UMEM → Wasm linear memory on ingress, Wasm → UMEM on PASS_MOD egress). This contradicts the zero-copy narrative.
+
+**Author's Counter**: "Can't we give the packet directly to Wasm for inline modification?"
+
+**Resolved Position**: No — not without destroying Wasm's core safety guarantee. Wasm's linear memory is a strictly isolated contiguous byte array. Two options exist:
+
+| Approach | How | Trade-off |
+|----------|-----|----------|
+| **Copy (current design)** | `memcpy` payload into Wasm linear memory, copy back on PASS_MOD | ✅ Safety preserved. Buggy plugin cannot corrupt adjacent packets or UMEM. Bounded overhead: 2×payload_len bytes per exception packet |
+| **Shared memory** | Map AF_XDP UMEM into Wasm linear memory via `memory.grow` + host allocator or Component Model shared memory proposal | ❌ Breaks isolation entirely. A buggy plugin can corrupt the live packet buffer and adjacent packets in the UMEM ring |
+
+> [!IMPORTANT]
+> **Paper action**: Reframe the claim as **"kernel-to-userspace zero-copy with bounded Wasm payload copy."** Quantify the copy cost in the evaluation (it's `2 × payload_len` bytes per exception-path packet). This is a genuine design tension between safety and performance — state it explicitly as a contribution to the design space discussion.
+
+This is actually a **strength** if framed correctly: the paper can argue that Wasm's memory isolation is the *price* of tenant-safe plugin execution, and the copy overhead is the quantifiable cost of that safety. No prior work has measured this trade-off in a telecom context.
+
+---
+
+### V2: Threading Model Gap
+
+**Original Concern**: The Rust daemon's threading model is unspecified. Single-threaded Wasm dispatch at 500μs timeout caps at ~2,000 packets/second — that's not a telecom system.
+
+**Author's Counter**: "That's an implementation detail to resolve during development."
+
+**Resolved Position**: Fair for Phase 1 prototype, but the paper **must not be silent** on this. If reviewers assume single-threaded, they will immediately reject the throughput claims.
+
+**Minimum paper statement** (one sentence in the design section):
+> *"The threading model of the Rust daemon is implementation-defined; multi-threaded dispatch with per-thread Wasm instances is the expected production configuration, following the pattern established by Envoy's per-worker-thread Wasm VM isolation."*
+
+**Phase 1 prototype scope**: Single RX queue + single-threaded is acceptable for validating RQ1 (per-packet latency) and RQ2 (hitless switchover). But state this limitation explicitly:
+- Single RX queue validates correctness and per-packet overhead
+- Multi-queue scalability is documented as future work with a clear path (per-queue AF_XDP socket pool, shared UMEM, per-thread Wasm instances)
+
+---
+
+### V3: Proxy-Wasm / Istio Prior Art Gap
+
+**Original Concern**: Istio's `WasmPlugin` CRD does most of what Layer 4 does. Envoy's inline Wasm execution is structurally similar to Layer 3. This weakens the novelty of the K8s operator and Wasm runtime layers.
+
+**Resolved Position**: This is the most important framing issue for the paper. The novelty table must explicitly address Proxy-Wasm:
+
+| Dimension | Proxy-Wasm (Envoy/Istio) | This Work |
+|-----------|--------------------------|----------|
+| Interception point | L7 HTTP proxy (user-space) | L2/L3 XDP (kernel, pre-stack) |
+| Plugin target | HTTP request/response streams | Raw GTP-U encapsulated L7 payloads |
+| Upgrade mechanism | Envoy listener drain (~seconds) | RCU-protected BPF map swap (~nanoseconds) |
+| CRD scope | Envoy sidecar filter chain | eBPF kernel maps + Wasm runtime + OCI lifecycle |
+| Protocol awareness | HTTP/gRPC | GTP-U/TEID |
+
+> [!CAUTION]
+> **The paper's strongest claim is RQ2 — the atomic sub-millisecond switchover via BPF map pointer swap.** That is novel, technically specific, and measurable. The "Wasm on K8s" parts are supporting infrastructure, not novel contributions. Frame accordingly.
+
+---
+
+### V4: veth Egress Stack Traversal
+
+**Author's Counter**: "Isn't eBPF placed at the very first stage? Why does the kernel stack matter?"
+
+**Resolved Position**: eBPF/XDP intercepts **inbound** packets at the earliest point (pre-`sk_buff`, at the driver). That is correct and not the issue. The issue is specifically on **egress after Wasm processing**:
+
+```
+Packet journey:
+NIC → XDP (fast, pre-stack) → AF_XDP → Wasm processing → XSK TX ring → veth TX → kernel stack → UPF
+                                                                         ^^^^^^^^^^^^^^^^^^^^^^^^^
+                                                                         This traverses: qdisc, netfilter, IP routing
+```
+
+The **second kernel stack crossing is real** and is the overhead cost of inline modification vs observe-only. It doesn't affect the fast-path 99%, but it is part of the exception-path per-packet latency budget.
+
+**Paper action**: Measure this cost explicitly in the evaluation. Expected overhead: ~2–5μs per packet from veth traversal. Frame it as a known, bounded cost.
+
+---
+
+### V5: Drain Window ↔ Fuel Budget Constraint
+
+**Original Concern**: `drainWindowMs` and `fuelBudget` are independent configuration parameters, but they are functionally coupled.
+
+**Resolved Position**: The paper must define the formal constraint:
+
+```
+drainWindowMs > P99.9(fuelBudget execution time for max-size GTP-U payload)
+```
+
+The HLD's default of 100ms should be validated against actual AOT-compiled Wasm execution times:
+- If P99.9 DPI execution is 50μs → 100ms drain window has 2000× safety margin ✅
+- If P99.9 DPI execution is 200ms → 100ms drain window causes data loss ❌
+
+This constraint should be enforced either as a **CRD validation webhook** or documented as an operator responsibility.
+
+---
+
+### V6: 8-Byte Metadata Header Stripping Gap
+
+**Original Concern**: The eBPF program prepends an 8-byte metadata header to the frame before `XDP_REDIRECT`. The HLD says the daemon "reads the metadata header" but never explicitly states it is **stripped before re-injection**.
+
+**Resolved Position**: The HLD needs one line added to Section 4.2's resubmission step:
+
+> *"Metadata header removed before writing to XSK TX ring. The frame written to the TX ring contains only the original Ethernet frame with any payload modifications applied."*
+
+Small fix, but required for correctness. Without this, the re-injected frame would have a malformed Ethernet header.
+
+---
+
+### V7: WasmEdge AOT Mode Requirement
+
+**Author's Counter**: "Startup time doesn't matter since v2 is fully warmed up before v1 is swapped out."
+
+**Resolved Position**: The author is correct — AOT compilation time does not affect packet latency (the HLD's upgrade flow correctly separates warm-up in Step 2 from the atomic swap in Step 4). However, the issue is narrower:
+
+The **500μs execution timeout** must be validated against **AOT-compiled** Wasm, not interpreted. Interpreted-mode WasmEdge would likely exceed 500μs for any non-trivial DPI scan (e.g., a 256-byte Boyer-Moore string search on a 1500B payload).
+
+**Paper action**: State "WasmEdge in AOT mode" explicitly in the system design section so the timeout claim is credible. If Phase 1 happens to prototype with interpreter mode, the 500μs timeout numbers must be re-calibrated.
+
+---
+
+### Vulnerability Summary Matrix
+
+| ID | Issue | Severity | Paper Impact | Resolution |
+|----|-------|----------|-------------|------------|
+| V1 | Zero-copy contradiction | 🔴 Critical | Reframe claim; measure copy cost | Reword as "kernel-to-userspace zero-copy with bounded Wasm copy" |
+| V2 | Threading model gap | 🔴 Critical | Add one-sentence threading statement | Acknowledge multi-threaded production config |
+| V3 | Proxy-Wasm prior art | 🔴 Critical | Add explicit differentiation table | Emphasize eBPF + GTP-U + BPF map atomicity as genuine novelty |
+| V4 | veth egress traversal | 🟡 Moderate | Measure in evaluation | Document as bounded, known cost |
+| V5 | Drain ↔ fuel constraint | 🟡 Moderate | Define formal relationship | `drainWindowMs > P99.9(fuel execution)` |
+| V6 | Metadata header stripping | 🟢 Minor | One-line HLD fix | Add explicit stripping step |
+| V7 | AOT mode requirement | 🟡 Moderate | State AOT explicitly | "WasmEdge in AOT mode" in design section |
+
+---
+
+## 7. Concrete Text for HLD Document Updates
+
+The following are copy-paste-ready paragraphs to add to `NaaS_5G_UPF_HLD.docx`.
+
+---
+
+### 7.1 Add to Section 9 (Novelty and Prior Art Position) — Proxy-Wasm Differentiation
+
+> *Istio's WasmPlugin CRD and Envoy's Proxy-Wasm ABI represent the closest architectural analogue in the service mesh domain. However, Proxy-Wasm operates at the L7 HTTP proxy layer in user-space, targeting request/response streams. This work operates at the L2/L3 XDP layer in kernel-space, targeting raw GTP-U encapsulated payloads. The upgrade mechanism differs fundamentally: Envoy performs a listener drain over seconds, while this work achieves sub-millisecond switchover via RCU-protected BPF map pointer swap. The two systems are complementary, not competing — Proxy-Wasm cannot inspect GTP-U tunneled traffic, and this work does not target HTTP.*
+
+---
+
+### 7.2 Add to Section 4.2 (Layer 2) — Checksum Recalculation
+
+> *On PASS_MOD verdict, the Rust daemon recalculates the UDP checksum over the modified payload before writing the frame to the XSK TX ring. Software recalculation is required because the veth reinjection path uses a virtual device that does not support hardware checksum offload (CHECKSUM_PARTIAL). The cost is approximately 100–200ns for a 1500B payload, which is negligible relative to the veth traversal overhead.*
+
+---
+
+### 7.3 Add to Section 4.2 (Layer 2) — Metadata Stripping
+
+> *Metadata header removed before writing to XSK TX ring. The frame written to the TX ring contains only the original Ethernet frame with any payload modifications applied.*
+
+---
+
+### 7.4 Add to Section 4.3 (Layer 3) — AOT Mode
+
+> *The Wasm runtime operates in Ahead-of-Time (AOT) compiled mode. The 500μs execution timeout is calibrated against AOT-compiled Wasm, not interpreted execution. AOT compilation occurs during the warm-up phase (Step 2 of the hitless upgrade flow) and does not affect per-packet processing latency.*
+
+---
+
+### 7.5 Add to Section 4.2 (Layer 2) — Threading Model
+
+> *The threading model of the Rust daemon is implementation-defined; multi-threaded dispatch with per-thread Wasm instances is the expected production configuration, following the pattern established by Envoy's per-worker-thread Wasm VM isolation. The Phase 1 prototype uses a single-threaded worker bound to a single AF_XDP RX queue to isolate variables for per-packet latency measurement and hitless switchover validation. Multi-queue scalability via RSS-mapped per-queue AF_XDP socket pools with shared UMEM is documented as future work.*
+
+---
+
+### 7.6 Add New Section — Multi-Tenant Isolation Model (Per-Slice Wasm Instantiation)
+
+> *Multi-tenant isolation is achieved through per-slice Wasm instantiation. Each network slice is assigned a dedicated Wasm runtime instance with an independent linear memory region, ensuring that a tenant's plugin cannot address another tenant's packet data. The eBPF exception map encodes a slice identifier alongside the plugin identifier in the map value: Key = TEID, Value = {slice_id, plugin_id}. The XDP program uses slice_id to redirect exception-path packets to the correct per-slice AF_XDP socket. This maps the Wasm isolation boundary directly to the 3GPP network slice, which is the natural multi-tenancy unit in 5G. Hitless upgrades are scoped per-slice: upgrading Slice A's plugin has zero impact on Slice B's processing. Phase 1 validates with a single slice; multi-slice isolation is an architectural guarantee validated in Phase 2.*
+
+---
+
+### 7.7 Add to Section 5 (Hitless Plugin Upgrade Flow) — Drain/Fuel Constraint
+
+> *Configuration constraint: drainWindowMs must exceed the P99.9 execution time of the fuelBudget for maximum-size GTP-U payloads. This ensures in-flight v1 invocations complete within the drain window. The default 100ms is calibrated assuming AOT-compiled DPI execution at P99.9 < 50μs, providing a 2000× safety margin.*
+
+---
+
+### 7.8 Add to Section 6 (End-to-End Packet Flow) — Zero-Copy Framing
+
+> *The data path achieves kernel-to-userspace zero-copy via AF_XDP shared UMEM. A bounded payload copy (2 × payload_len bytes per exception-path packet) is performed at the Wasm boundary to preserve Wasm linear memory isolation. This is a deliberate safety/performance trade-off: the copy overhead is the measurable cost of guaranteeing that a tenant's plugin cannot corrupt the shared packet buffer or adjacent packets in the UMEM ring.*
+
+---
+
+### 7.9 Add to Section 9 (Novelty) — DPDK Comparison
+
+> *This work uses eBPF/XDP rather than DPDK for three reasons: (1) eBPF programs run within the kernel and do not require dedicated CPU cores or exclusive NIC driver binding, preserving standard Kubernetes scheduling; (2) eBPF maps are accessible from both kernel and user-space, enabling the atomic pointer swap mechanism central to this work's hitless upgrade contribution; (3) eBPF integrates natively with the Linux networking stack, allowing the exception-path veth reinjection without custom driver development. DPDK would require a fully user-space UPF implementation and kernel bypass, which conflicts with the goal of augmenting existing 3GPP-compliant UPFs (e.g., Open5GS) without modification.*
+
+---
+
+### 7.10 Add to Section 8 (Phase 1 Scope) — Future Work Items
+
+> *Not validated in Phase 1 (documented as future work):*
+> - *PFCP session event subscription for dynamic TEID discovery from the SMF*
+> - *Multi-slice concurrent isolation (architectural guarantee validated in Phase 2)*
+> - *Multi-queue RSS-mapped AF_XDP scaling with per-thread Wasm instances*
+> - *AF_XDP-to-AF_XDP direct reinjection bypass (eliminating veth traversal overhead)*
+> - *Inner 5-tuple secondary filter for sub-TEID exception routing granularity*
