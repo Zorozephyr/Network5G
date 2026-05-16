@@ -1,0 +1,21 @@
+# Learning Curriculum Task Tracker
+
+- `[x]` **Module 1: Modern NIC Architectures & Hardware Acceleration**
+  - `[x]` SmartNICs & ASICs
+  - `[x]` Super NICs, DPUs, & RDMA
+  - `[x]` CPU architecture (GNR-D) for networking
+- `[x]` **Module 2: High-Performance Packet Processing & Linux Datapath**
+  - `[x]` SR-IOV & DPDK
+  - `[x]` Linux Kernel Datapath (DMA -> NIC Driver -> XDP/eBPF -> TC -> Netfilter -> IP -> GTPU)
+  - `[x]` Slice Based Fast Path
+- `[x]` **Module 3: 5G RAN Architecture & Virtualization**
+  - `[x]` xDU architecture
+  - `[x]` RU -> VDU (DSCP)
+  - `[x]` Arcus VM CU, VDU
+- `[ ]` **Module 4: Advanced Routing, SD-WAN, and Telemetry**
+  - `[ ]` URLLC Requirements
+  - `[ ]` Software CSR vs Hardware CSR
+  - `[ ]` Segment Routing & BGP
+  - `[ ]` SD-WAN -> MPCS
+  - `[ ]` Open Switch (OVS)
+  - `[ ]` Telemetry (OAM, FIC, FIU)
