@@ -22,5 +22,9 @@ DOCA Libraries: C/C+= libraries mapping directly to hardware accelarators.
     DOCA Compress
     DOCA Telemetry
 
-
+Feature,DPDK,SmartNIC,DPU,SuperNIC
+Type,Software,Hardware,Hardware,Hardware
+Primary Job,Software Kernel Bypass,Hardware Task Offload,Infrastructure Isolation,AI GPU-to-GPU Fabric
+Control Plane,Host OS,Host OS,Local DPU OS,Host/Fabric Controller
+Key Use Case,"NFV, Fast packet processing","VSwitch offload, telemetry","Cloud multi-tenancy, Zero-trust",Generative AI training clusters
 
