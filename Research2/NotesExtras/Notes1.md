@@ -47,3 +47,6 @@
 | **Accel.** | Inline hardware blocks (QAT, DLB, DSA) | Dedicated NPU / Switch ASIC |
 | **Network** | Integrated Ethernet ports (up to 100G) | Acts as the NIC to the 400G+ network |
 | **Security**| Shares Host CPU trust domain | "Zero Trust" isolated from Host CPU |
+
+
+Why Not UPF: Not able to find a usecase which needs the architecture i propose
