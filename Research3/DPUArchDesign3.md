@@ -1,7 +1,7 @@
 # DPU-Resident AI for Network Slicing with Intelligent Tunnel Lifecycle: System Architecture (v4)
 
 **Date:** June 2026 | **Hardware Target:** NVIDIA BlueField-3 (BF3)  
-**Revision:** v4 — Extends v3 with: tunnel lifecycle engine, AI cold-start QoS seeding, converged CU-UP/UPF GTP-U pipeline, predictive flow rule pre-installation, comprehensive AI opportunity map. Corrects tunnel topology per 3GPP architecture review.
+**Revision:** v4.1 — Extends v4 with 9 verified architectural corrections: two-pipe DOCA Flow chain (per SDK constraint), BF-3 SKU-qualified ARM core count, flex parser requirement for PSC/QFI extraction, unvalidated meter modify latency flagged as hypothesis, eSwitch rule table sizing analysis, corrected hw_slice counter access model (doca_flow_query → C11 atomics), FOMAML offline-only adaptation, cold-start dataset generation plan, and ModifyTunnel atomic TEID swap protocol for handover.
 
 ---
 
@@ -38,7 +38,7 @@ This architecture eliminates **both** the steady-state latency bottleneck **and*
 | Metric | Value | Definition |
 |---|---|---|
 | **Control loop period** | 1–10 ms (Δt) | How often telemetry drives new AI inference |
-| **Actuation latency** | Target: <20 µs | Decision trigger → eSwitch meter enforcement |
+| **Actuation latency** | Hypothesis: <20 µs ⚠️ | Decision trigger → eSwitch meter enforcement. **Unvalidated** — `mlx5_flow_meter_modify()` latency on pre-allocated meters has no published benchmark. Budget viable up to ~80 µs (still beats dApps 450 µs). Requires DOCA Bench microbenchmark. |
 | **🆕 Tunnel setup latency** | Target: <500 µs | PFCP Rx → AI-seeded meters + pre-installed eSwitch rules |
 
 ### 1.5 Comparison Against Current SOTA
@@ -81,7 +81,7 @@ The BlueField-3 DPU contains three distinct compute components on one chip:
 | Component | Has OS? | Nature | Role in This System |
 |---|---|---|---|
 | **eSwitch + ConnectX-7 ASIC** | No. Pure silicon. | **True hardware** | Per-packet flow classification, GTP-U encap/decap, counter updates, meter enforcement at 400 Gbps |
-| **16× ARM Cortex-A78 cores** | Yes — Ubuntu 24.04 | **Software on dedicated HW** | 🤖 AI inference (TCN + cold-start), decision engine, SHAL API, PFCP processing, model lifecycle |
+| **16× ARM Cortex-A78 cores (B3240 SKU)** | Yes — Ubuntu 24.04 | **Software on dedicated HW** | 🤖 AI inference (TCN + cold-start), decision engine, SHAL API, PFCP processing, model lifecycle. ⚠️ **SKU note:** 8-core E-Series variants (B3220L) exist — core allocation strategy scales to 8 with reduced concurrency. Verify via `nproc` on target hardware. |
 | **DPA (Data Path Accelerator)** | No. Programmable µthreads. | **Programmable hardware** | 16 cores / 256 threads for custom packet processing (🤖 future: DPA-resident micro-inference) |
 
 > 🤖 = AI opportunity point (see Section 11 for comprehensive map)
@@ -122,12 +122,16 @@ struct hw_slice {
     uint32_t  burst_size;          // CBS in bytes
     uint64_t  min_guaranteed;      // Absolute floor
 
-    // ─── Hardware counters (written by eSwitch, read by ARM) ───
-    _Atomic uint64_t  byte_count;
-    _Atomic uint64_t  pkt_count;
-    _Atomic uint64_t  drop_count;
-    _Atomic uint64_t  last_arrival_ns;
-    _Atomic uint16_t  queue_depth;
+    // ─── Hardware counters (retrieved via doca_flow_query(), NOT direct C11 atomics) ───
+    // ACCESS MODEL: eSwitch writes counters in HW register space. ARM calls
+    // doca_flow_query() which DMA/MMIO-copies values into this buffer.
+    // _Atomic semantics apply to ARM inter-core synchronization of the
+    // buffered copies, NOT to direct eSwitch register access.
+    _Atomic uint64_t  byte_count;       // Buffered from doca_flow_query()
+    _Atomic uint64_t  pkt_count;        // Buffered from doca_flow_query()
+    _Atomic uint64_t  drop_count;       // Buffered from doca_flow_query()
+    _Atomic uint64_t  last_arrival_ns;  // Buffered from doca_flow_query()
+    _Atomic uint16_t  queue_depth;      // Buffered from doca_flow_query()
 
     // ─── AI state (written by ARM decision engine) ───
     uint64_t  ai_predicted_demand; // ŷ(t+T) from TCN
@@ -251,8 +255,12 @@ Model: MLP, <1K parameters, INT8 quantized
   Output: Linear(8→4) → [initial_CIR, initial_PIR, initial_burst, confidence]
 
 Training: Meta-learning (MAML-style)
-  • Trained on historical {context → initial_traffic_pattern} across cells/slices
-  • At deployment: adapts with <10 gradient steps to new cell characteristics
+  • Meta-trained offline on historical {context → initial_traffic_pattern} across cells/slices
+  • Per-cell adaptation: <10 FOMAML gradient steps run OFFLINE per {S-NSSAI, DNN, cell_id}
+    tuple when the model is deployed to a new cell. Produces a frozen, adapted checkpoint.
+  • ⚠️ At tunnel creation: single forward pass only (<5 µs). NO gradient computation.
+    The adapted model is already frozen — backprop on DPU ARM at tunnel creation
+    is infeasible within the <500 µs setup budget and unnecessary.
   • Inference: <5 µs on ARM A78 (tiny model, fully in L1 cache)
 ```
 
@@ -338,20 +346,43 @@ Packet → DU (RLC/MAC) → [F1-U encap] → CU-UP (SDAP/PDCP + F1-U decap + N3 
          ↑ 2 PCIe transfers, 2 context switches, 2 memory copies
 ```
 
-**Proposed converged path (1 hardware pass):**
+**Proposed converged path (two-pipe hardware chain, zero ARM cores per packet):**
+
+> ⚠️ **DOCA Flow Constraint:** A single pipe cannot have both a changeable shared encap/decap action and a changeable FWD action simultaneously (verified: NVIDIA DOCA Flow Programming Guide). The converged pipeline therefore uses a **two-pipe chain**, both executing entirely within the eSwitch ASIC.
+
 ```
 F1-U GTP-U packet arrives at DPU port
-  → eSwitch Stage 1: F1-U GTP-U decap (TEID → bearer mapping)
-  → eSwitch Stage 2: SDAP/QFI extraction (header field copy — trivial)
-  → eSwitch Stage 3: Flow classify → hw_slice lookup → counter update
-  → eSwitch Stage 4: Meter enforcement (AI-managed CIR/PIR)
-  → eSwitch Stage 5: N3 GTP-U re-encap (toward core/DN) OR direct route
-  → Wire (400 Gbps)
+
+  Pipe A (Ingress — TEID-keyed, per-session entries):
+    → Stage 1: Outer header match (MAC, VLAN, IP, UDP dst=2152)
+    → Stage 2: F1-U GTP-U decap (match on incoming TEID_X)
+    → Stage 3: QFI extraction via DPL flex node parsing of GTP-U PDU Session
+               Container extension header (type 0x85, 3GPP TS 38.415).
+               ⚠️ Requires explicit flex parser definition — NOT a built-in
+               DOCA Flow match field. One-time setup cost, zero per-packet cost.
+    → Stage 4: Flow classify → hw_slice lookup → counter update
+    → Stage 5: Meter enforcement (AI-managed CIR/PIR)
+    → set metadata(session_ctx: N3_TEID_Y, UPF_IP) → fwd to Pipe B
+
+  Pipe B (Egress — encap, per-session pre-configured shared resources):
+    → Stage 6: match(metadata.session_ctx)
+    → Stage 7: shared_encap(N3 TEID_Y, UPF_IP, GTP-U outer headers) → route
+    → Wire (400 Gbps)
 ```
 
+**Key property:** Both pipes execute within the eSwitch ASIC in a single hardware pass. No recirculation, no ARM core involvement, no PCIe transfer. The NVIDIA DOCA "GTP Full Tunnel Application" reference implementation confirms this two-pipe pattern for GTP-U decap→re-encap workflows.
+
+**Rule table sizing (per active tunnel):**
+- Pipe A: 1 entry (match F1-U TEID + meter + counter)
+- Pipe B: 1 entry (shared encap resource binding)
+- Total: ~2 eSwitch entries + 1 meter + 1 counter per tunnel
+- BF-3 FDB capacity: up to ~800K 5-tuple entries per flow group (4 groups default)
+- Conservative estimate: **~200K concurrent tunnels** before rule table pressure
+- ⚠️ Must validate with DOCA Bench under load; complex match criteria consume more resources per entry than simple 5-tuple rules
+
 **Scope boundary:** PDCP ciphering/integrity (SNOW3G/AES/ZUC) remains on host CPU or DPU ARM cores. Only the **GTP-U encap/decap and QFI mapping** move to eSwitch. This is achievable because:
-- SDAP is just a QFI↔QoS lookup table — pure eSwitch operation
-- GTP-U encap/decap is already proven on BF-3 via DOCA Accel UPF
+- SDAP is just a QFI↔QoS lookup table — pure eSwitch operation (after flex parser setup)
+- GTP-U encap/decap is already proven on BF-3 via DOCA Accel UPF and GTP Full Tunnel App
 - PDCP is stateful and complex — moving it is unnecessary for the tunnel collapse benefit
 
 ---
@@ -362,16 +393,20 @@ F1-U GTP-U packet arrives at DPU port
 
 ```
 1. F1-U GTP-U packet arrives at DPU 400GbE port (from DU)
-2. eSwitch pipeline (7 hardware stages, zero software):
-   Stage 1: Outer header match (MAC, VLAN, IP)
-   Stage 2: F1-U GTP-U decapsulation — extract TEID + QFI from PDU Session
+2. Two-pipe eSwitch chain (7 hardware stages across 2 pipes, zero software):
+   Pipe A (Ingress):
+   Stage 1: Outer header match (MAC, VLAN, IP, UDP dst=2152)
+   Stage 2: F1-U GTP-U decapsulation — match on TEID
+   Stage 3: QFI extraction via DPL flex node parsing of PDU Session
             Container extension header (type 0x85, per 3GPP TS 38.415)
-            ✓ VERIFIED: BF-3 supports RTE_FLOW_ITEM_TYPE_GTP_PSC at line rate
-   Stage 3: Flow classification — QFI → 5QI → slice_id via lookup table
-   Stage 4: Atomic counter update in eSwitch SRAM (hw_slice[slice_id])
-   Stage 5: Meter check — pass/drop based on committed_rate
-   Stage 6: 🆕 N3 GTP-U re-encapsulation (if routing toward core network)
-   Stage 7: Forward to destination (network port, host PCIe, or ARM)
+            ✓ VERIFIED: BF-3 supports GTP_PSC matching after flex parser setup
+   Stage 4: Flow classification — QFI → 5QI → slice_id via lookup table
+   Stage 5: Counter update via doca_flow monitor (hw_slice[slice_id])
+            Meter check — pass/drop based on committed_rate
+            → set metadata(session_ctx) → fwd to Pipe B
+   Pipe B (Egress):
+   Stage 6: 🆕 N3 GTP-U re-encapsulation via shared_encap resource
+   Stage 7: Route → forward to destination (network port or ARM)
 3. ARM core involvement: ZERO. Host CPU involvement: ZERO.
 ```
 
@@ -420,7 +455,8 @@ F1-U GTP-U packet arrives at DPU port
 
 ```
 9. ARM updates pre-allocated DOCA Flow meter via mlx5_flow_meter_modify()
-   - Memory-mapped register update (~1–5 µs), NOT flow rule insertion
+   - Memory-mapped register update (⚠️ estimated ~1–5 µs, UNVALIDATED), NOT flow rule insertion
+   - No published benchmark exists for this specific operation on BF-3
 10. eSwitch immediately enforces new limits on NEXT packet
 11. Loop repeats at next Δt
 ```
@@ -432,10 +468,10 @@ F1-U GTP-U packet arrives at DPU port
 | B | DMA snapshot + features | ~1 µs |
 | C | 🤖 TCN inference (INT8, NEON) | ~7–80 µs |
 | C | 🤖 Decision + preemption | ~1–2 µs |
-| D | Meter update (pre-allocated) | ~1–5 µs |
-| **Total** | **Actuation** | **~10–88 µs** |
+| D | Meter update (pre-allocated) | ~1–5 µs ⚠️ (hypothesis) |
+| **Total** | **Actuation** | **~10–88 µs (hypothesis)** |
 
-> ⚠ **Validation Requirement:** TCN inference estimate is bounded by ARM Cortex-A78 benchmarks, NOT measured on BF-3. Hardware microbenchmarking mandatory before submission.
+> ⚠ **Validation Requirement:** Both TCN inference AND meter modify latency are estimates, NOT measured on BF-3. The meter modify estimate (~1–5 µs) assumes pre-allocated DOCA Flow meters with Hardware Steering (HWS) mode; NVIDIA publishes no benchmark for this operation. DOCA Bench microbenchmarking mandatory before any submission. Budget remains viable up to ~150 µs total (still 3× faster than dApps' 450 µs).
 
 ---
 
@@ -460,7 +496,7 @@ No standardized interface exists between management plane and hardware enforceme
 | Operation | Direction | Description |
 |---|---|---|
 | `EstablishTunnel(pfcp_session)` | SMF → DPU | 🤖 Trigger cold-start AI, seed meters, pre-install eSwitch rules |
-| `ModifyTunnel(session_id, params)` | SMF → DPU | Update TEID/QFI mapping mid-session (handover) |
+| `ModifyTunnel(session_id, params)` | SMF → DPU | Update TEID/QFI mapping mid-session (handover). **Atomic swap protocol:** (1) Install new Pipe A + Pipe B entries with target TEIDs (~600 µs), (2) Verify entries active via `doca_flow_entries_process()`, (3) Delete old Pipe A + Pipe B entries, (4) Update hw_slice TEIDs. Total: <2 ms, well within 50 ms Xn handover budget. Order is critical: **install-before-delete** to prevent slow-path window. |
 | `ReleaseTunnel(session_id)` | SMF → DPU | Teardown: remove flow rules, release meters, free hw_slice |
 | `GetTunnelHealth(session_id)` | DPU → SMF | Report cold-start vs steady-state, confidence, warmup progress |
 
@@ -538,8 +574,24 @@ def preempt(requesting_slice, deficit, all_slices):
 
 ### 8.3 ARM Memory Model: Concurrency Protocol
 
+> ⚠️ **Two-Layer Access Model:** eSwitch counters are hardware registers, NOT C memory. ARM cores
+> retrieve counter values via `doca_flow_query()` (DMA/MMIO copy from HW register space into an
+> ARM-accessible buffer). C11 `_Atomic` semantics then synchronize access to these **buffered copies**
+> across ARM cores. The code below operates on the ARM-side shadow buffer, not on eSwitch registers directly.
+
 ```c
-// TELEMETRY CORE (reader): atomic snapshot
+// LAYER 1: HW counter retrieval (telemetry core, periodic)
+// Calls doca_flow_query() which DMA-copies HW register values into ARM buffer
+void refresh_hw_counters(struct hw_slice *slice, struct doca_flow_pipe_entry *entry) {
+    struct doca_flow_query stats;
+    doca_flow_query(entry, &stats);  // HW → ARM buffer via DMA/MMIO
+    // Store into shared hw_slice with release semantics for cross-core visibility
+    __atomic_store_n(&slice->byte_count, stats.total_bytes, __ATOMIC_RELEASE);
+    __atomic_store_n(&slice->pkt_count,  stats.total_pkts,  __ATOMIC_RELEASE);
+}
+
+// LAYER 2: ARM inter-core synchronization (inference/preemption cores)
+// Reads the buffered copies with acquire semantics
 void snapshot_slice_state(struct hw_slice *src, struct slice_snapshot *dst) {
     dst->byte_count     = __atomic_load_n(&src->byte_count, __ATOMIC_ACQUIRE);
     dst->pkt_count      = __atomic_load_n(&src->pkt_count, __ATOMIC_ACQUIRE);
@@ -548,9 +600,11 @@ void snapshot_slice_state(struct hw_slice *src, struct slice_snapshot *dst) {
     dst->committed_rate = __atomic_load_n(&src->committed_rate, __ATOMIC_ACQUIRE);
 }
 
-// PREEMPTION CORE (writer): release semantics
+// PREEMPTION CORE (writer): release semantics for meter parameter updates
 void commit_rate_update(struct hw_slice *slice, uint64_t new_rate) {
     __atomic_store_n(&slice->committed_rate, new_rate, __ATOMIC_RELEASE);
+    // Actual HW enforcement: ARM then calls mlx5_flow_meter_modify() to push
+    // the new rate to the eSwitch meter — a separate HW write operation
 }
 ```
 
@@ -619,7 +673,7 @@ void commit_rate_update(struct hw_slice *slice, uint64_t new_rate) {
 | Initial training | ORANSlice (Bonati et al.) | O-RAN SC traffic profiles. GitHub: wineslab/ORANSlice |
 | Supplementary | UPC/Zenodo 5G Slicing | Packet-level simulations, 3 slice types |
 | Supplementary | CRAWDAD mobile traces | Real-world wireless for distribution validation |
-| 🆕 Cold-start training | Aggregated PFCP session logs | Historical {context → first-30s-traffic} mappings |
+| 🆕 Cold-start training | Self-generated PFCP session dataset | ⚠️ **No public dataset exists** with paired {PFCP context → initial traffic}. Must instrument Open5GS/free5gc + srsRAN to log PFCP session parameters alongside per-session traffic profiles for first 30s. Est. 2 weeks instrumentation + 1 week collection (~10K sessions × 3 slice types). See Phase 1 plan. |
 | Post-hardware | Self-collected via SHAL | 72h of real telemetry for fine-tuning |
 
 ### 10.2 Deployment Pipeline
@@ -823,9 +877,10 @@ BF-3 ARM L1 cache: 64 KB per core. **All models fit in a single core's L1 with r
 
 | Deliverable | Description |
 |---|---|
-| SHAL Protobuf spec (v4) | All operations from §7 including tunnel lifecycle |
+| SHAL Protobuf spec (v4) | All operations from §7 including tunnel lifecycle + ModifyTunnel atomic swap protocol |
 | ns-3 closed-loop simulation | TCN + CQR + preemption + cold-start handoff |
-| Cold-start MLP training | MAML-based training on ORANSlice + synthetic PFCP logs |
+| 🆕 Cold-start dataset generation | Instrument Open5GS + srsRAN to collect {PFCP context → first-30s-traffic} pairs. Target: 10K sessions × 3 slice types. **Prerequisite for MLP training.** (2 weeks instrumentation + 1 week collection) |
+| Cold-start MLP training | FOMAML-based offline training on self-generated dataset + ORANSlice traffic profiles. Per-cell adapted checkpoints frozen for deployment. |
 | CQR framework validation | Offline coverage guarantees on 5G traffic traces |
 | **Publication target** | **HotNets position paper: SHAL + cold-start as standalone** |
 
@@ -844,9 +899,9 @@ BF-3 ARM L1 cache: 64 KB per core. **All models fit in a single core's L1 with r
 | End-to-end testbed | srsRAN + BF-3 + PFCP simulator + 3 slices |
 | All 12 measurements from §14 | Against dApp, PreNS, HiP4-UPF baselines |
 | Cold-start evaluation | 5QI-default vs AI-seeded across 1000 tunnel creations |
-| Converged pipeline validation | F1-U→N3 single-pass vs separate CU-UP + UPF |
+| Converged pipeline validation | F1-U→N3 two-pipe hardware chain vs separate CU-UP + UPF |
 | **Publication target** | **Full system paper: NSDI or USENIX ATC** |
 
 ---
 
-*Architecture v4 prepared June 2026. Extends v3 with: tunnel lifecycle engine (cold-start AI, predictive flow rule pre-installation, converged GTP-U pipeline), comprehensive AI opportunity map (13 identified AI points across 5 lifecycle phases), corrected 5G tunnel topology (F1-U + N3 architecture per 3GPP), updated competitive analysis (HiP4-UPF ATC '24, AccelUPF, DOCA Accel UPF), and expanded measurement plan (12 metrics, 5 microbenchmarks). Hardware specs from NVIDIA BlueField-3 docs, DOCA SDK 3.x, Hot Chips 2023.*
+*Architecture v4.1 prepared June 2026. v4.1 corrections (9 fixes): converged GTP-U pipeline corrected to two-pipe DOCA Flow chain per SDK constraint on changeable shared encap + changeable FWD, BF-3 ARM core count qualified by SKU (16-core B3240 vs 8-core E-Series), PSC/QFI extraction corrected to require DPL flex parser definition, actuation latency reclassified as hypothesis pending DOCA Bench microbenchmark, eSwitch rule table sizing analysis added (~200K concurrent tunnels conservative estimate), hw_slice counter access model corrected to two-layer (doca_flow_query → C11 atomics on buffer), MAML deployment corrected to offline FOMAML per-cell adaptation with frozen checkpoints at tunnel creation, cold-start training data gap addressed with Open5GS instrumentation plan, ModifyTunnel atomic swap protocol specified for Xn handover TEID churn. Original v4 extends v3 with: tunnel lifecycle engine, AI cold-start QoS seeding, converged CU-UP/UPF GTP-U pipeline, predictive flow rule pre-installation, comprehensive AI opportunity map. Hardware specs from NVIDIA BlueField-3 docs, DOCA SDK 3.x, Hot Chips 2023.*
